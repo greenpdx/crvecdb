@@ -1,4 +1,8 @@
 use std::path::Path;
+use std::sync::Arc;
+
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 
 use crate::config::{DistanceMetric, HnswConfig, IndexConfig, VectorId};
 use crate::distance::{create_distance, Distance};
@@ -57,6 +61,16 @@ impl IndexBuilder {
 enum StorageBackend {
     Memory(MemoryStorage),
     Mmap(MmapStorage),
+}
+
+impl StorageBackend {
+    /// Thread-safe push
+    fn push_sync(&self, id: VectorId, vector: &[f32]) -> Result<crate::config::InternalId> {
+        match self {
+            Self::Memory(s) => s.push_sync(id, vector),
+            Self::Mmap(s) => s.push_sync(id, vector),
+        }
+    }
 }
 
 impl VectorStorage for StorageBackend {
@@ -121,7 +135,7 @@ impl VectorStorage for StorageBackend {
 pub struct Index {
     storage: StorageBackend,
     graph: HnswGraph,
-    distance: Box<dyn Distance>,
+    distance: Arc<dyn Distance>,
     config: IndexConfig,
 }
 
@@ -135,7 +149,7 @@ impl Index {
     pub fn new_memory(config: IndexConfig) -> Result<Self> {
         let storage = MemoryStorage::new(&config);
         let graph = HnswGraph::new(config.hnsw);
-        let distance = create_distance(config.metric);
+        let distance: Arc<dyn Distance> = Arc::from(create_distance(config.metric));
 
         Ok(Self {
             storage: StorageBackend::Memory(storage),
@@ -149,7 +163,7 @@ impl Index {
     pub fn new_mmap(config: IndexConfig, path: &Path) -> Result<Self> {
         let storage = MmapStorage::create(path, &config)?;
         let graph = HnswGraph::new(config.hnsw);
-        let distance = create_distance(config.metric);
+        let distance: Arc<dyn Distance> = Arc::from(create_distance(config.metric));
 
         Ok(Self {
             storage: StorageBackend::Mmap(storage),
@@ -176,7 +190,7 @@ impl Index {
         };
 
         let graph = HnswGraph::new(config.hnsw);
-        let distance = create_distance(config.metric);
+        let distance: Arc<dyn Distance> = Arc::from(create_distance(config.metric));
 
         // TODO: Load graph from separate file
 
@@ -189,7 +203,7 @@ impl Index {
     }
 
     /// Insert a single vector
-    pub fn insert(&mut self, id: VectorId, vector: &[f32]) -> Result<()> {
+    pub fn insert(&self, id: VectorId, vector: &[f32]) -> Result<()> {
         if vector.len() != self.config.dimension {
             return Err(CrvecError::DimensionMismatch {
                 expected: self.config.dimension,
@@ -197,18 +211,44 @@ impl Index {
             });
         }
 
-        let internal_id = self.storage.push(id, vector)?;
+        let internal_id = self.storage.push_sync(id, vector)?;
         self.graph
             .insert(internal_id, &self.storage, self.distance.as_ref());
 
         Ok(())
     }
 
-    /// Insert multiple vectors
-    pub fn insert_batch(&mut self, vectors: &[(VectorId, Vec<f32>)]) -> Result<()> {
+    /// Insert multiple vectors sequentially
+    pub fn insert_batch(&self, vectors: &[(VectorId, Vec<f32>)]) -> Result<()> {
         for (id, vector) in vectors {
             self.insert(*id, vector)?;
         }
+        Ok(())
+    }
+
+    /// Insert multiple vectors in parallel using Rayon
+    /// Both storage writes and graph building happen in parallel
+    #[cfg(feature = "parallel")]
+    pub fn insert_parallel(&self, vectors: &[(VectorId, Vec<f32>)]) -> Result<()> {
+        // Validate all vectors first
+        for (_, vector) in vectors {
+            if vector.len() != self.config.dimension {
+                return Err(CrvecError::DimensionMismatch {
+                    expected: self.config.dimension,
+                    got: vector.len(),
+                });
+            }
+        }
+
+        // Parallel: Push to storage and build graph for each vector
+        // Storage uses atomic slot allocation, so each thread gets unique slots
+        vectors.par_iter().try_for_each(|(id, vector)| {
+            let internal_id = self.storage.push_sync(*id, vector)?;
+            self.graph
+                .insert(internal_id, &self.storage, self.distance.as_ref());
+            Ok::<_, CrvecError>(())
+        })?;
+
         Ok(())
     }
 

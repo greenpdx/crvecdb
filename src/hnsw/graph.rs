@@ -1,5 +1,6 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use ordered_float::OrderedFloat;
 use parking_lot::RwLock;
@@ -12,14 +13,16 @@ use crate::storage::VectorStorage;
 /// Maximum number of layers
 pub const MAX_LAYERS: usize = 16;
 
+/// Sentinel value for no entry point
+const NO_ENTRY_POINT: u32 = u32::MAX;
+
 /// A node in the HNSW graph
-#[derive(Clone, Debug)]
 #[allow(dead_code)]
 pub struct HnswNode {
     /// Maximum layer this node exists on
     pub max_layer: usize,
     /// Neighbors at each layer: neighbors[layer] = Vec<InternalId>
-    pub neighbors: Vec<Vec<InternalId>>,
+    pub neighbors: Vec<RwLock<Vec<InternalId>>>,
 }
 
 impl HnswNode {
@@ -27,7 +30,7 @@ impl HnswNode {
         let mut neighbors = Vec::with_capacity(max_layer + 1);
         for layer in 0..=max_layer {
             let capacity = if layer == 0 { config.m0 } else { config.m };
-            neighbors.push(Vec::with_capacity(capacity));
+            neighbors.push(RwLock::new(Vec::with_capacity(capacity)));
         }
         Self {
             max_layer,
@@ -36,14 +39,14 @@ impl HnswNode {
     }
 }
 
-/// The HNSW graph structure
+/// The HNSW graph structure (thread-safe)
 pub struct HnswGraph {
     /// Nodes indexed by InternalId
-    pub nodes: Vec<RwLock<HnswNode>>,
-    /// Entry point (highest layer node)
-    pub entry_point: Option<InternalId>,
+    pub nodes: RwLock<Vec<HnswNode>>,
+    /// Entry point (highest layer node), NO_ENTRY_POINT if none
+    entry_point: AtomicU32,
     /// Current maximum layer
-    pub max_level: usize,
+    max_level: AtomicUsize,
     /// Configuration
     pub config: HnswConfig,
 }
@@ -51,22 +54,37 @@ pub struct HnswGraph {
 impl HnswGraph {
     pub fn new(config: HnswConfig) -> Self {
         Self {
-            nodes: Vec::new(),
-            entry_point: None,
-            max_level: 0,
+            nodes: RwLock::new(Vec::new()),
+            entry_point: AtomicU32::new(NO_ENTRY_POINT),
+            max_level: AtomicUsize::new(0),
             config,
         }
+    }
+
+    /// Get current entry point
+    pub fn get_entry_point(&self) -> Option<InternalId> {
+        let ep = self.entry_point.load(Ordering::Acquire);
+        if ep == NO_ENTRY_POINT {
+            None
+        } else {
+            Some(ep)
+        }
+    }
+
+    /// Get current max level
+    pub fn get_max_level(&self) -> usize {
+        self.max_level.load(Ordering::Acquire)
     }
 
     /// Get number of nodes
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
-        self.nodes.len()
+        self.nodes.read().len()
     }
 
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
-        self.nodes.is_empty()
+        self.nodes.read().is_empty()
     }
 
     /// Generate random level for new node
@@ -77,9 +95,9 @@ impl HnswGraph {
         level.min(MAX_LAYERS - 1)
     }
 
-    /// Insert a new vector into the graph
+    /// Thread-safe insert - can be called from multiple threads
     pub fn insert(
-        &mut self,
+        &self,
         internal_id: InternalId,
         storage: &dyn VectorStorage,
         distance: &dyn Distance,
@@ -87,24 +105,43 @@ impl HnswGraph {
         let insert_level = self.random_level();
         let node = HnswNode::new(insert_level, &self.config);
 
-        // First node becomes entry point
-        if self.entry_point.is_none() {
-            self.entry_point = Some(internal_id);
-            self.max_level = insert_level;
-            self.nodes.push(RwLock::new(node));
+        // Add node to the graph first
+        {
+            let mut nodes = self.nodes.write();
+            // Ensure we have space up to this ID
+            while nodes.len() <= internal_id as usize {
+                // This shouldn't happen in normal use, but handle it
+                nodes.push(HnswNode::new(0, &self.config));
+            }
+            nodes[internal_id as usize] = node;
+        }
+
+        // Try to become the first entry point
+        if self
+            .entry_point
+            .compare_exchange(
+                NO_ENTRY_POINT,
+                internal_id,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            self.max_level.store(insert_level, Ordering::Release);
             return;
         }
 
         let query = storage.get_vector(internal_id);
-        let mut current = self.entry_point.unwrap();
+        let mut current = self.entry_point.load(Ordering::Acquire);
+        let current_max_level = self.max_level.load(Ordering::Acquire);
 
         // Phase 1: Traverse from top to insert_level + 1 with greedy search
-        for level in (insert_level + 1..=self.max_level).rev() {
+        for level in (insert_level + 1..=current_max_level).rev() {
             current = self.search_layer_single(query, current, level, storage, distance);
         }
 
         // Phase 2: Insert at levels insert_level down to 0
-        let top_level = insert_level.min(self.max_level);
+        let top_level = insert_level.min(current_max_level);
         for level in (0..=top_level).rev() {
             let candidates =
                 self.search_layer(query, current, self.config.ef_construction, level, storage, distance);
@@ -117,30 +154,26 @@ impl HnswGraph {
 
             let selected = self.select_neighbors_simple(&candidates, max_neighbors);
 
-            // Add node first so we can write to it
-            if level == top_level {
-                self.nodes.push(RwLock::new(node.clone()));
-            }
-
             // Add connections from new node to selected neighbors
             {
-                let mut new_node = self.nodes[internal_id as usize].write();
-                new_node.neighbors[level] = selected.clone();
+                let nodes = self.nodes.read();
+                let mut new_node_neighbors = nodes[internal_id as usize].neighbors[level].write();
+                *new_node_neighbors = selected.clone();
             }
 
             // Add reverse connections
             for &neighbor_id in &selected {
-                let mut neighbor = self.nodes[neighbor_id as usize].write();
-                let neighbor_neighbors = &mut neighbor.neighbors[level];
+                let nodes = self.nodes.read();
+                let mut neighbor_neighbors = nodes[neighbor_id as usize].neighbors[level].write();
 
                 if neighbor_neighbors.len() < max_neighbors {
                     neighbor_neighbors.push(internal_id);
                 } else {
                     // Shrink connections if over capacity
                     neighbor_neighbors.push(internal_id);
-                    self.shrink_connections(
+                    self.shrink_connections_locked(
                         neighbor_id,
-                        neighbor_neighbors,
+                        &mut neighbor_neighbors,
                         max_neighbors,
                         storage,
                         distance,
@@ -154,10 +187,20 @@ impl HnswGraph {
             }
         }
 
-        // Update entry point if new node has higher level
-        if insert_level > self.max_level {
-            self.entry_point = Some(internal_id);
-            self.max_level = insert_level;
+        // Update entry point if new node has higher level (CAS loop)
+        loop {
+            let old_max = self.max_level.load(Ordering::Acquire);
+            if insert_level <= old_max {
+                break;
+            }
+            if self
+                .max_level
+                .compare_exchange(old_max, insert_level, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                self.entry_point.store(internal_id, Ordering::Release);
+                break;
+            }
         }
     }
 
@@ -174,14 +217,17 @@ impl HnswGraph {
         let mut current_dist = distance.distance(query, storage.get_vector(entry));
 
         loop {
-            let node = self.nodes[current as usize].read();
+            let nodes = self.nodes.read();
+            let neighbors = nodes[current as usize].neighbors[level].read();
             let mut improved = false;
+            let mut best = current;
+            let mut best_dist = current_dist;
 
-            for &neighbor_id in &node.neighbors[level] {
+            for &neighbor_id in neighbors.iter() {
                 let neighbor_dist = distance.distance(query, storage.get_vector(neighbor_id));
-                if neighbor_dist < current_dist {
-                    current = neighbor_id;
-                    current_dist = neighbor_dist;
+                if neighbor_dist < best_dist {
+                    best = neighbor_id;
+                    best_dist = neighbor_dist;
                     improved = true;
                 }
             }
@@ -189,6 +235,8 @@ impl HnswGraph {
             if !improved {
                 break;
             }
+            current = best;
+            current_dist = best_dist;
         }
 
         current
@@ -204,7 +252,8 @@ impl HnswGraph {
         storage: &dyn VectorStorage,
         distance: &dyn Distance,
     ) -> Vec<(f32, InternalId)> {
-        let mut visited = vec![false; self.nodes.len().max(entry as usize + 1)];
+        let num_nodes = self.nodes.read().len();
+        let mut visited = vec![false; num_nodes.max(entry as usize + 1)];
         visited[entry as usize] = true;
 
         let entry_dist = distance.distance(query, storage.get_vector(entry));
@@ -225,8 +274,13 @@ impl HnswGraph {
                 break;
             }
 
-            let node = self.nodes[c_id as usize].read();
-            for &neighbor_id in &node.neighbors[level] {
+            // Get neighbors for this node
+            let neighbor_ids: Vec<InternalId> = {
+                let nodes = self.nodes.read();
+                nodes[c_id as usize].neighbors[level].read().clone()
+            };
+
+            for neighbor_id in neighbor_ids {
                 if neighbor_id as usize >= visited.len() {
                     visited.resize(neighbor_id as usize + 1, false);
                 }
@@ -268,8 +322,8 @@ impl HnswGraph {
             .collect()
     }
 
-    /// Shrink connections to max_neighbors
-    fn shrink_connections(
+    /// Shrink connections with already-locked neighbors
+    fn shrink_connections_locked(
         &self,
         node_id: InternalId,
         neighbors: &mut Vec<InternalId>,

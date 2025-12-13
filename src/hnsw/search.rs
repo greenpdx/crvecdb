@@ -25,15 +25,17 @@ impl HnswGraph {
         storage: &dyn VectorStorage,
         distance: &dyn Distance,
     ) -> Vec<SearchResult> {
-        if self.entry_point.is_none() {
-            return Vec::new();
-        }
+        let entry_point = match self.get_entry_point() {
+            Some(ep) => ep,
+            None => return Vec::new(),
+        };
 
         let ef = ef_search.max(k);
-        let mut current = self.entry_point.unwrap();
+        let mut current = entry_point;
+        let max_level = self.get_max_level();
 
         // Phase 1: Traverse top layers with greedy search
-        for level in (1..=self.max_level).rev() {
+        for level in (1..=max_level).rev() {
             current = self.search_layer_greedy(query, current, level, storage, distance);
         }
 
@@ -64,14 +66,19 @@ impl HnswGraph {
         let mut current_dist = distance.distance(query, storage.get_vector(entry));
 
         loop {
-            let node = self.nodes[current as usize].read();
+            let neighbor_ids: Vec<InternalId> = {
+                let nodes = self.nodes.read();
+                nodes[current as usize].neighbors[level].read().clone()
+            };
             let mut improved = false;
+            let mut best = current;
+            let mut best_dist = current_dist;
 
-            for &neighbor_id in &node.neighbors[level] {
+            for neighbor_id in neighbor_ids {
                 let neighbor_dist = distance.distance(query, storage.get_vector(neighbor_id));
-                if neighbor_dist < current_dist {
-                    current = neighbor_id;
-                    current_dist = neighbor_dist;
+                if neighbor_dist < best_dist {
+                    best = neighbor_id;
+                    best_dist = neighbor_dist;
                     improved = true;
                 }
             }
@@ -79,6 +86,8 @@ impl HnswGraph {
             if !improved {
                 break;
             }
+            current = best;
+            current_dist = best_dist;
         }
 
         current
@@ -93,7 +102,8 @@ impl HnswGraph {
         storage: &dyn VectorStorage,
         distance: &dyn Distance,
     ) -> Vec<(f32, InternalId)> {
-        let mut visited = vec![false; self.nodes.len()];
+        let num_nodes = self.nodes.read().len();
+        let mut visited = vec![false; num_nodes];
         visited[entry as usize] = true;
 
         let entry_dist = distance.distance(query, storage.get_vector(entry));
@@ -113,8 +123,15 @@ impl HnswGraph {
                 break;
             }
 
-            let node = self.nodes[c_id as usize].read();
-            for &neighbor_id in &node.neighbors[0] {
+            let neighbor_ids: Vec<InternalId> = {
+                let nodes = self.nodes.read();
+                nodes[c_id as usize].neighbors[0].read().clone()
+            };
+
+            for neighbor_id in neighbor_ids {
+                if neighbor_id as usize >= visited.len() {
+                    visited.resize(neighbor_id as usize + 1, false);
+                }
                 if visited[neighbor_id as usize] {
                     continue;
                 }

@@ -1,17 +1,28 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::cell::UnsafeCell;
+
 use crate::config::{IndexConfig, InternalId, VectorId};
 use crate::distance::l2_norm;
 use crate::error::{CrvecError, Result};
 use crate::storage::VectorStorage;
 
-/// In-memory vector storage
+/// In-memory vector storage optimized for parallel bulk loading
 #[allow(dead_code)]
 pub struct MemoryStorage {
     dimension: usize,
-    ids: Vec<VectorId>,
-    norms: Vec<f32>,
-    vectors: Vec<f32>, // Flat array: vectors[i*dim..(i+1)*dim]
     capacity: usize,
+    /// Number of vectors stored
+    len: AtomicUsize,
+    /// Storage arrays (pre-allocated for parallel access)
+    ids: UnsafeCell<Vec<VectorId>>,
+    norms: UnsafeCell<Vec<f32>>,
+    vectors: UnsafeCell<Vec<f32>>, // Flat array: vectors[i*dim..(i+1)*dim]
 }
+
+// SAFETY: We ensure thread safety through careful slot assignment
+// Each thread writes to its own unique slot
+unsafe impl Send for MemoryStorage {}
+unsafe impl Sync for MemoryStorage {}
 
 #[allow(dead_code)]
 impl MemoryStorage {
@@ -19,21 +30,61 @@ impl MemoryStorage {
         let capacity = config.capacity;
         Self {
             dimension: config.dimension,
-            ids: Vec::with_capacity(capacity),
-            norms: Vec::with_capacity(capacity),
-            vectors: Vec::with_capacity(capacity * config.dimension),
             capacity,
+            len: AtomicUsize::new(0),
+            ids: UnsafeCell::new(vec![0; capacity]),
+            norms: UnsafeCell::new(vec![0.0; capacity]),
+            vectors: UnsafeCell::new(vec![0.0; capacity * config.dimension]),
         }
     }
 
     pub fn with_capacity(dimension: usize, capacity: usize) -> Self {
         Self {
             dimension,
-            ids: Vec::with_capacity(capacity),
-            norms: Vec::with_capacity(capacity),
-            vectors: Vec::with_capacity(capacity * dimension),
             capacity,
+            len: AtomicUsize::new(0),
+            ids: UnsafeCell::new(vec![0; capacity]),
+            norms: UnsafeCell::new(vec![0.0; capacity]),
+            vectors: UnsafeCell::new(vec![0.0; capacity * dimension]),
         }
+    }
+
+    /// Thread-safe push using atomic increment for slot allocation
+    pub fn push_sync(&self, id: VectorId, vector: &[f32]) -> Result<InternalId> {
+        if vector.len() != self.dimension {
+            return Err(CrvecError::DimensionMismatch {
+                expected: self.dimension,
+                got: vector.len(),
+            });
+        }
+
+        // Atomically allocate a slot
+        let slot = self.len.fetch_add(1, Ordering::AcqRel) as InternalId;
+
+        if slot as usize >= self.capacity {
+            return Err(CrvecError::InvalidFormat("capacity exceeded".into()));
+        }
+
+        let norm = l2_norm(vector);
+
+        // SAFETY: Each slot is written exactly once, no concurrent access
+        unsafe {
+            let ids = &mut *self.ids.get();
+            let norms = &mut *self.norms.get();
+            let vectors = &mut *self.vectors.get();
+
+            ids[slot as usize] = id;
+            norms[slot as usize] = norm;
+            let start = slot as usize * self.dimension;
+            vectors[start..start + self.dimension].copy_from_slice(vector);
+        }
+
+        Ok(slot)
+    }
+
+    /// Get dimension
+    pub fn get_dimension(&self) -> usize {
+        self.dimension
     }
 }
 
@@ -43,7 +94,7 @@ impl VectorStorage for MemoryStorage {
     }
 
     fn len(&self) -> usize {
-        self.ids.len()
+        self.len.load(Ordering::Acquire)
     }
 
     fn capacity(&self) -> usize {
@@ -51,35 +102,34 @@ impl VectorStorage for MemoryStorage {
     }
 
     fn push(&mut self, id: VectorId, vector: &[f32]) -> Result<InternalId> {
-        if vector.len() != self.dimension {
-            return Err(CrvecError::DimensionMismatch {
-                expected: self.dimension,
-                got: vector.len(),
-            });
-        }
-
-        let internal_id = self.ids.len() as InternalId;
-        let norm = l2_norm(vector);
-
-        self.ids.push(id);
-        self.norms.push(norm);
-        self.vectors.extend_from_slice(vector);
-
-        Ok(internal_id)
+        // Delegate to thread-safe version
+        self.push_sync(id, vector)
     }
 
     fn get_vector(&self, internal_id: InternalId) -> &[f32] {
         let idx = internal_id as usize;
         let start = idx * self.dimension;
-        &self.vectors[start..start + self.dimension]
+        // SAFETY: Pre-allocated storage, reading from already-written slot
+        unsafe {
+            let vectors = &*self.vectors.get();
+            &vectors[start..start + self.dimension]
+        }
     }
 
     fn get_id(&self, internal_id: InternalId) -> VectorId {
-        self.ids[internal_id as usize]
+        // SAFETY: Pre-allocated storage, reading from already-written slot
+        unsafe {
+            let ids = &*self.ids.get();
+            ids[internal_id as usize]
+        }
     }
 
     fn get_norm(&self, internal_id: InternalId) -> f32 {
-        self.norms[internal_id as usize]
+        // SAFETY: Pre-allocated storage, reading from already-written slot
+        unsafe {
+            let norms = &*self.norms.get();
+            norms[internal_id as usize]
+        }
     }
 }
 

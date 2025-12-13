@@ -1,7 +1,9 @@
 use std::fs::{File, OpenOptions};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use memmap2::MmapMut;
+use parking_lot::RwLock;
 
 use crate::config::{IndexConfig, InternalId, VectorId};
 use crate::distance::l2_norm;
@@ -9,15 +11,15 @@ use crate::error::{CrvecError, Result};
 use crate::storage::layout::{file_size, vector_stride, StorageHeader, VectorMeta};
 use crate::storage::VectorStorage;
 
-/// Memory-mapped file storage
+/// Memory-mapped file storage (thread-safe)
 pub struct MmapStorage {
     #[allow(dead_code)]
     file: File,
-    mmap: MmapMut,
+    mmap: RwLock<MmapMut>,
     dimension: usize,
     stride: usize,
-    count: usize,
-    capacity: usize,
+    count: AtomicUsize,
+    capacity: AtomicUsize,
 }
 
 impl MmapStorage {
@@ -46,11 +48,11 @@ impl MmapStorage {
 
         Ok(Self {
             file,
-            mmap,
+            mmap: RwLock::new(mmap),
             dimension,
             stride,
-            count: 0,
-            capacity,
+            count: AtomicUsize::new(0),
+            capacity: AtomicUsize::new(capacity),
         })
     }
 
@@ -70,40 +72,52 @@ impl MmapStorage {
 
         Ok(Self {
             file,
-            mmap,
+            mmap: RwLock::new(mmap),
             dimension,
             stride,
-            count: header.count as usize,
-            capacity: header.capacity as usize,
+            count: AtomicUsize::new(header.count as usize),
+            capacity: AtomicUsize::new(header.capacity as usize),
         })
     }
 
-    /// Grow capacity (requires remapping)
-    pub fn grow(&mut self, new_capacity: usize) -> Result<()> {
-        if new_capacity <= self.capacity {
-            return Ok(());
+    /// Thread-safe push
+    pub fn push_sync(&self, id: VectorId, vector: &[f32]) -> Result<InternalId> {
+        if vector.len() != self.dimension {
+            return Err(CrvecError::DimensionMismatch {
+                expected: self.dimension,
+                got: vector.len(),
+            });
         }
 
-        let new_size = file_size(self.dimension, new_capacity);
+        let mut mmap = self.mmap.write();
+        let count = self.count.load(Ordering::Acquire);
+        let capacity = self.capacity.load(Ordering::Acquire);
 
-        // Flush current changes
-        self.mmap.flush()?;
+        // For now, don't support growing in thread-safe mode
+        if count >= capacity {
+            return Err(CrvecError::InvalidFormat("capacity exceeded".into()));
+        }
 
-        // Resize file
-        self.file.set_len(new_size as u64)?;
+        let internal_id = count as InternalId;
+        let offset = 64 + count * self.stride;
 
-        // Remap
-        self.mmap = unsafe { MmapMut::map_mut(&self.file)? };
+        // Write metadata
+        let norm = l2_norm(vector);
+        let meta = VectorMeta::new(id, norm);
+        mmap[offset..offset + 16].copy_from_slice(&meta.to_bytes());
 
-        // Update header capacity
-        self.capacity = new_capacity;
-        self.mmap[24..32].copy_from_slice(&(new_capacity as u64).to_le_bytes());
+        // Write vector data
+        let data_offset = offset + 16;
+        for (i, &val) in vector.iter().enumerate() {
+            let byte_offset = data_offset + i * 4;
+            mmap[byte_offset..byte_offset + 4].copy_from_slice(&val.to_le_bytes());
+        }
 
-        Ok(())
-    }
+        let new_count = count + 1;
+        self.count.store(new_count, Ordering::Release);
+        mmap[16..24].copy_from_slice(&(new_count as u64).to_le_bytes());
 
-    fn update_count(&mut self) {
-        self.mmap[16..24].copy_from_slice(&(self.count as u64).to_le_bytes());
+        Ok(internal_id)
     }
 }
 
@@ -113,67 +127,42 @@ impl VectorStorage for MmapStorage {
     }
 
     fn len(&self) -> usize {
-        self.count
+        self.count.load(Ordering::Acquire)
     }
 
     fn capacity(&self) -> usize {
-        self.capacity
+        self.capacity.load(Ordering::Acquire)
     }
 
     fn push(&mut self, id: VectorId, vector: &[f32]) -> Result<InternalId> {
-        if vector.len() != self.dimension {
-            return Err(CrvecError::DimensionMismatch {
-                expected: self.dimension,
-                got: vector.len(),
-            });
-        }
-
-        // Grow if needed
-        if self.count >= self.capacity {
-            let new_cap = (self.capacity * 2).max(1024);
-            self.grow(new_cap)?;
-        }
-
-        let internal_id = self.count as InternalId;
-        let offset = 64 + self.count * self.stride;
-
-        // Write metadata
-        let norm = l2_norm(vector);
-        let meta = VectorMeta::new(id, norm);
-        self.mmap[offset..offset + 16].copy_from_slice(&meta.to_bytes());
-
-        // Write vector data
-        let data_offset = offset + 16;
-        for (i, &val) in vector.iter().enumerate() {
-            let byte_offset = data_offset + i * 4;
-            self.mmap[byte_offset..byte_offset + 4].copy_from_slice(&val.to_le_bytes());
-        }
-
-        self.count += 1;
-        self.update_count();
-
-        Ok(internal_id)
+        // Delegate to thread-safe version
+        self.push_sync(id, vector)
     }
 
     fn get_vector(&self, internal_id: InternalId) -> &[f32] {
         let offset = 64 + (internal_id as usize) * self.stride + 16;
+        let mmap = self.mmap.read();
+        // SAFETY: mmap is pinned in memory as long as file exists
         unsafe {
-            std::slice::from_raw_parts(self.mmap[offset..].as_ptr() as *const f32, self.dimension)
+            let ptr = mmap[offset..].as_ptr() as *const f32;
+            std::slice::from_raw_parts(ptr, self.dimension)
         }
     }
 
     fn get_id(&self, internal_id: InternalId) -> VectorId {
         let offset = 64 + (internal_id as usize) * self.stride;
-        u64::from_le_bytes(self.mmap[offset..offset + 8].try_into().unwrap())
+        let mmap = self.mmap.read();
+        u64::from_le_bytes(mmap[offset..offset + 8].try_into().unwrap())
     }
 
     fn get_norm(&self, internal_id: InternalId) -> f32 {
         let offset = 64 + (internal_id as usize) * self.stride + 8;
-        f32::from_le_bytes(self.mmap[offset..offset + 4].try_into().unwrap())
+        let mmap = self.mmap.read();
+        f32::from_le_bytes(mmap[offset..offset + 4].try_into().unwrap())
     }
 
     fn flush(&self) -> Result<()> {
-        self.mmap.flush()?;
+        self.mmap.read().flush()?;
         Ok(())
     }
 }
