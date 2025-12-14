@@ -4,11 +4,14 @@
 //! Download: ftp://ftp.irisa.fr/local/texmex/corpus/sift.tar.gz
 
 use crvecdb::{DistanceMetric, Index};
-use rayon::prelude::*;
 use std::fs::File;
 use std::io::{BufReader, Read};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
+
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
+#[cfg(feature = "parallel")]
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const DATA_DIR: &str = "data/sift";
 
@@ -27,7 +30,10 @@ fn main() {
     println!("  Load time:     {:?}\n", start.elapsed());
 
     // Build index
+    #[cfg(feature = "parallel")]
     println!("[2/4] Building index (parallel)...");
+    #[cfg(not(feature = "parallel"))]
+    println!("[2/4] Building index...");
     let start = Instant::now();
     let index = Index::builder(128)
         .metric(DistanceMetric::Euclidean)
@@ -47,29 +53,52 @@ fn main() {
     println!("  Build time:    {:?}", build_time);
     println!("  Vectors/sec:   {:.0}\n", base.len() as f64 / build_time.as_secs_f64());
 
-    // Benchmark search (parallel)
+    // Benchmark search
+    #[cfg(feature = "parallel")]
     println!("[3/4] Benchmarking search (parallel)...\n");
+    #[cfg(not(feature = "parallel"))]
+    println!("[3/4] Benchmarking search...\n");
 
     for &k in &[1, 10, 100] {
         let start = Instant::now();
-        let correct = AtomicU64::new(0);
 
-        queries.par_iter().enumerate().for_each(|(i, query)| {
-            let results = index.search(query, k).unwrap();
-            let gt_set: std::collections::HashSet<_> = groundtruth[i][..k].iter().copied().collect();
+        #[cfg(feature = "parallel")]
+        let correct = {
+            let correct = AtomicU64::new(0);
+            queries.par_iter().enumerate().for_each(|(i, query)| {
+                let results = index.search(query, k).unwrap();
+                let gt_set: std::collections::HashSet<_> = groundtruth[i][..k].iter().copied().collect();
 
-            let mut local_correct = 0u64;
-            for result in &results {
-                if gt_set.contains(&(result.id as i32)) {
-                    local_correct += 1;
+                let mut local_correct = 0u64;
+                for result in &results {
+                    if gt_set.contains(&(result.id as i32)) {
+                        local_correct += 1;
+                    }
+                }
+                correct.fetch_add(local_correct, Ordering::Relaxed);
+            });
+            correct.load(Ordering::Relaxed)
+        };
+
+        #[cfg(not(feature = "parallel"))]
+        let correct = {
+            let mut correct = 0u64;
+            for (i, query) in queries.iter().enumerate() {
+                let results = index.search(query, k).unwrap();
+                let gt_set: std::collections::HashSet<_> = groundtruth[i][..k].iter().copied().collect();
+
+                for result in &results {
+                    if gt_set.contains(&(result.id as i32)) {
+                        correct += 1;
+                    }
                 }
             }
-            correct.fetch_add(local_correct, Ordering::Relaxed);
-        });
+            correct
+        };
 
         let elapsed = start.elapsed();
         let total = queries.len() as u64 * k as u64;
-        let recall = correct.load(Ordering::Relaxed) as f64 / total as f64 * 100.0;
+        let recall = correct as f64 / total as f64 * 100.0;
         let qps = queries.len() as f64 / elapsed.as_secs_f64();
 
         println!("  Recall@{:<3} {:.2}%  |  QPS: {:.0}  |  Time: {:?}", k, recall, qps, elapsed);

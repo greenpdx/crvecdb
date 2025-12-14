@@ -226,9 +226,9 @@ impl Index {
         Ok(())
     }
 
-    /// Insert multiple vectors in parallel using Rayon
-    /// Both storage writes and graph building happen in parallel
-    #[cfg(feature = "parallel")]
+    /// Insert multiple vectors in parallel (when `parallel` feature enabled)
+    /// or sequentially (when disabled). Both storage writes and graph building
+    /// happen concurrently when parallel.
     pub fn insert_parallel(&self, vectors: &[(VectorId, Vec<f32>)]) -> Result<()> {
         // Validate all vectors first
         for (_, vector) in vectors {
@@ -240,14 +240,27 @@ impl Index {
             }
         }
 
-        // Parallel: Push to storage and build graph for each vector
-        // Storage uses atomic slot allocation, so each thread gets unique slots
-        vectors.par_iter().try_for_each(|(id, vector)| {
-            let internal_id = self.storage.push_sync(*id, vector)?;
-            self.graph
-                .insert(internal_id, &self.storage, self.distance.as_ref());
-            Ok::<_, CrvecError>(())
-        })?;
+        #[cfg(feature = "parallel")]
+        {
+            // Parallel: Push to storage and build graph for each vector
+            // Storage uses atomic slot allocation, so each thread gets unique slots
+            vectors.par_iter().try_for_each(|(id, vector)| {
+                let internal_id = self.storage.push_sync(*id, vector)?;
+                self.graph
+                    .insert(internal_id, &self.storage, self.distance.as_ref());
+                Ok::<_, CrvecError>(())
+            })?;
+        }
+
+        #[cfg(not(feature = "parallel"))]
+        {
+            // Sequential fallback
+            for (id, vector) in vectors {
+                let internal_id = self.storage.push_sync(*id, vector)?;
+                self.graph
+                    .insert(internal_id, &self.storage, self.distance.as_ref());
+            }
+        }
 
         Ok(())
     }
