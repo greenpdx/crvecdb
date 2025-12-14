@@ -152,7 +152,7 @@ impl HnswGraph {
         }
 
         let mut result_vec: Vec<_> = results.into_iter().map(|(d, id)| (d.0, id)).collect();
-        result_vec.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        result_vec.sort_by(|a, b| a.0.total_cmp(&b.0));
         result_vec
     }
 }

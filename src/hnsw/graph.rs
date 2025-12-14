@@ -1,5 +1,8 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
+use std::fs::File;
+use std::io::{BufReader, BufWriter, Read, Write};
+use std::path::Path;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use ordered_float::OrderedFloat;
@@ -8,6 +11,7 @@ use rand::Rng;
 
 use crate::config::{HnswConfig, InternalId};
 use crate::distance::Distance;
+use crate::error::{CrvecError, Result};
 use crate::storage::VectorStorage;
 
 /// Maximum number of layers
@@ -305,7 +309,7 @@ impl HnswGraph {
 
         // Convert to sorted vec (best first)
         let mut result_vec: Vec<_> = results.into_iter().map(|(d, id)| (d.0, id)).collect();
-        result_vec.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        result_vec.sort_by(|a, b| a.0.total_cmp(&b.0));
         result_vec
     }
 
@@ -346,9 +350,143 @@ impl HnswGraph {
             })
             .collect();
 
-        with_dist.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        with_dist.sort_by(|a, b| a.0.total_cmp(&b.0));
 
         neighbors.clear();
         neighbors.extend(with_dist.iter().take(max_neighbors).map(|(_, id)| *id));
+    }
+
+    /// Save graph to file
+    ///
+    /// File format:
+    /// - Magic: 4 bytes "HNSW"
+    /// - Version: 4 bytes (1)
+    /// - Entry point: 4 bytes (u32, NO_ENTRY_POINT if none)
+    /// - Max level: 4 bytes (u32)
+    /// - M: 4 bytes (u32)
+    /// - M0: 4 bytes (u32)
+    /// - Num nodes: 4 bytes (u32)
+    /// - For each node:
+    ///   - max_layer: 1 byte
+    ///   - For each layer 0..=max_layer:
+    ///     - num_neighbors: 2 bytes (u16)
+    ///     - neighbors: num_neighbors * 4 bytes (u32 each)
+    pub fn save_to_file(&self, path: &Path) -> Result<()> {
+        let file = File::create(path)?;
+        let mut writer = BufWriter::new(file);
+
+        // Magic
+        writer.write_all(b"HNSW")?;
+        // Version
+        writer.write_all(&1u32.to_le_bytes())?;
+        // Entry point
+        writer.write_all(&self.entry_point.load(Ordering::Acquire).to_le_bytes())?;
+        // Max level
+        writer.write_all(&(self.max_level.load(Ordering::Acquire) as u32).to_le_bytes())?;
+        // M and M0
+        writer.write_all(&(self.config.m as u32).to_le_bytes())?;
+        writer.write_all(&(self.config.m0 as u32).to_le_bytes())?;
+
+        let nodes = self.nodes.read();
+        // Num nodes
+        writer.write_all(&(nodes.len() as u32).to_le_bytes())?;
+
+        // Write each node
+        for node in nodes.iter() {
+            // max_layer
+            writer.write_all(&[node.max_layer as u8])?;
+
+            // Each layer's neighbors
+            for layer in 0..=node.max_layer {
+                let neighbors = node.neighbors[layer].read();
+                writer.write_all(&(neighbors.len() as u16).to_le_bytes())?;
+                for &neighbor in neighbors.iter() {
+                    writer.write_all(&neighbor.to_le_bytes())?;
+                }
+            }
+        }
+
+        writer.flush()?;
+        Ok(())
+    }
+
+    /// Load graph from file
+    pub fn load_from_file(path: &Path) -> Result<Self> {
+        let file = File::open(path)?;
+        let mut reader = BufReader::new(file);
+
+        // Magic
+        let mut magic = [0u8; 4];
+        reader.read_exact(&mut magic)?;
+        if &magic != b"HNSW" {
+            return Err(CrvecError::InvalidFormat("invalid graph magic".into()));
+        }
+
+        // Version
+        let mut buf4 = [0u8; 4];
+        reader.read_exact(&mut buf4)?;
+        let version = u32::from_le_bytes(buf4);
+        if version != 1 {
+            return Err(CrvecError::InvalidFormat(format!("unsupported graph version: {}", version)));
+        }
+
+        // Entry point
+        reader.read_exact(&mut buf4)?;
+        let entry_point = u32::from_le_bytes(buf4);
+
+        // Max level
+        reader.read_exact(&mut buf4)?;
+        let max_level = u32::from_le_bytes(buf4) as usize;
+
+        // M and M0
+        reader.read_exact(&mut buf4)?;
+        let m = u32::from_le_bytes(buf4) as usize;
+        reader.read_exact(&mut buf4)?;
+        let m0 = u32::from_le_bytes(buf4) as usize;
+
+        // Num nodes
+        reader.read_exact(&mut buf4)?;
+        let num_nodes = u32::from_le_bytes(buf4) as usize;
+
+        let config = HnswConfig {
+            m,
+            m0,
+            ef_construction: 200,
+            ml: 1.0 / (m as f64).ln(),
+        };
+
+        let mut nodes = Vec::with_capacity(num_nodes);
+
+        // Read each node
+        for _ in 0..num_nodes {
+            // max_layer
+            let mut buf1 = [0u8; 1];
+            reader.read_exact(&mut buf1)?;
+            let max_layer = buf1[0] as usize;
+
+            let mut neighbors = Vec::with_capacity(max_layer + 1);
+            for _ in 0..=max_layer {
+                // num_neighbors
+                let mut buf2 = [0u8; 2];
+                reader.read_exact(&mut buf2)?;
+                let num_neighbors = u16::from_le_bytes(buf2) as usize;
+
+                let mut layer_neighbors = Vec::with_capacity(num_neighbors);
+                for _ in 0..num_neighbors {
+                    reader.read_exact(&mut buf4)?;
+                    layer_neighbors.push(u32::from_le_bytes(buf4));
+                }
+                neighbors.push(RwLock::new(layer_neighbors));
+            }
+
+            nodes.push(HnswNode { max_layer, neighbors });
+        }
+
+        Ok(Self {
+            nodes: RwLock::new(nodes),
+            entry_point: AtomicU32::new(entry_point),
+            max_level: AtomicUsize::new(max_level),
+            config,
+        })
     }
 }

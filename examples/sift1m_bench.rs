@@ -114,7 +114,7 @@ fn main() {
         latencies.push(start.elapsed().as_secs_f64() * 1000.0); // ms
     }
 
-    latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    latencies.sort_by(|a, b| a.total_cmp(b));
 
     let p50 = latencies[latencies.len() / 2];
     let p95 = latencies[latencies.len() * 95 / 100];

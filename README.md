@@ -76,7 +76,11 @@ let index = Index::builder(768)
 
 // Data persists automatically
 index.insert(1, &vec![0.1; 768]).unwrap();
-index.flush().unwrap();  // Ensure durability
+index.flush().unwrap();  // Saves both vectors and HNSW graph
+
+// Reopen later
+let index = Index::open_mmap("/path/to/index.db").unwrap();
+// Graph is restored - no rebuild needed!
 ```
 
 ## Distance Metrics

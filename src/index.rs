@@ -60,7 +60,7 @@ impl IndexBuilder {
 
 enum StorageBackend {
     Memory(MemoryStorage),
-    Mmap(MmapStorage),
+    Mmap { storage: MmapStorage, path: std::path::PathBuf },
 }
 
 impl StorageBackend {
@@ -68,7 +68,19 @@ impl StorageBackend {
     fn push_sync(&self, id: VectorId, vector: &[f32]) -> Result<crate::config::InternalId> {
         match self {
             Self::Memory(s) => s.push_sync(id, vector),
-            Self::Mmap(s) => s.push_sync(id, vector),
+            Self::Mmap { storage, .. } => storage.push_sync(id, vector),
+        }
+    }
+
+    /// Get the graph file path (only for mmap backend)
+    fn graph_path(&self) -> Option<std::path::PathBuf> {
+        match self {
+            Self::Memory(_) => None,
+            Self::Mmap { path, .. } => {
+                let mut graph_path = path.clone();
+                graph_path.set_extension("graph");
+                Some(graph_path)
+            }
         }
     }
 }
@@ -77,56 +89,56 @@ impl VectorStorage for StorageBackend {
     fn dimension(&self) -> usize {
         match self {
             Self::Memory(s) => s.dimension(),
-            Self::Mmap(s) => s.dimension(),
+            Self::Mmap { storage, .. } => storage.dimension(),
         }
     }
 
     fn len(&self) -> usize {
         match self {
             Self::Memory(s) => s.len(),
-            Self::Mmap(s) => s.len(),
+            Self::Mmap { storage, .. } => storage.len(),
         }
     }
 
     fn capacity(&self) -> usize {
         match self {
             Self::Memory(s) => s.capacity(),
-            Self::Mmap(s) => s.capacity(),
+            Self::Mmap { storage, .. } => storage.capacity(),
         }
     }
 
     fn push(&mut self, id: VectorId, vector: &[f32]) -> Result<crate::config::InternalId> {
         match self {
             Self::Memory(s) => s.push(id, vector),
-            Self::Mmap(s) => s.push(id, vector),
+            Self::Mmap { storage, .. } => storage.push(id, vector),
         }
     }
 
     fn get_vector(&self, internal_id: crate::config::InternalId) -> &[f32] {
         match self {
             Self::Memory(s) => s.get_vector(internal_id),
-            Self::Mmap(s) => s.get_vector(internal_id),
+            Self::Mmap { storage, .. } => storage.get_vector(internal_id),
         }
     }
 
     fn get_id(&self, internal_id: crate::config::InternalId) -> VectorId {
         match self {
             Self::Memory(s) => s.get_id(internal_id),
-            Self::Mmap(s) => s.get_id(internal_id),
+            Self::Mmap { storage, .. } => storage.get_id(internal_id),
         }
     }
 
     fn get_norm(&self, internal_id: crate::config::InternalId) -> f32 {
         match self {
             Self::Memory(s) => s.get_norm(internal_id),
-            Self::Mmap(s) => s.get_norm(internal_id),
+            Self::Mmap { storage, .. } => storage.get_norm(internal_id),
         }
     }
 
     fn flush(&self) -> Result<()> {
         match self {
             Self::Memory(s) => s.flush(),
-            Self::Mmap(s) => s.flush(),
+            Self::Mmap { storage, .. } => storage.flush(),
         }
     }
 }
@@ -166,7 +178,7 @@ impl Index {
         let distance: Arc<dyn Distance> = Arc::from(create_distance(config.metric));
 
         Ok(Self {
-            storage: StorageBackend::Mmap(storage),
+            storage: StorageBackend::Mmap { storage, path: path.to_path_buf() },
             graph,
             distance,
             config,
@@ -182,20 +194,30 @@ impl Index {
         let metric = DistanceMetric::from_u32(header.metric)
             .ok_or_else(|| CrvecError::InvalidFormat("unknown metric".into()))?;
 
+        // Try to load graph from file
+        let mut graph_path = path.to_path_buf();
+        graph_path.set_extension("graph");
+
+        let (graph, hnsw_config) = if graph_path.exists() {
+            let loaded_graph = HnswGraph::load_from_file(&graph_path)?;
+            let config = loaded_graph.config;
+            (loaded_graph, config)
+        } else {
+            let config = HnswConfig::default();
+            (HnswGraph::new(config), config)
+        };
+
         let config = IndexConfig {
             dimension: header.dimension as usize,
             metric,
-            hnsw: HnswConfig::default(),
+            hnsw: hnsw_config,
             capacity: header.capacity as usize,
         };
 
-        let graph = HnswGraph::new(config.hnsw);
         let distance: Arc<dyn Distance> = Arc::from(create_distance(config.metric));
 
-        // TODO: Load graph from separate file
-
         Ok(Self {
-            storage: StorageBackend::Mmap(storage),
+            storage: StorageBackend::Mmap { storage, path: path.to_path_buf() },
             graph,
             distance,
             config,
@@ -307,8 +329,17 @@ impl Index {
     }
 
     /// Flush to disk (for mmap storage)
+    ///
+    /// This saves both the vector data and the HNSW graph structure.
     pub fn flush(&self) -> Result<()> {
-        self.storage.flush()
+        self.storage.flush()?;
+
+        // Save graph for mmap storage
+        if let Some(graph_path) = self.storage.graph_path() {
+            self.graph.save_to_file(&graph_path)?;
+        }
+
+        Ok(())
     }
 }
 
@@ -318,7 +349,7 @@ mod tests {
 
     #[test]
     fn test_index_basic() {
-        let mut index = Index::builder(3)
+        let index = Index::builder(3)
             .metric(DistanceMetric::Euclidean)
             .m(8)
             .ef_construction(50)
@@ -341,7 +372,7 @@ mod tests {
 
     #[test]
     fn test_index_cosine() {
-        let mut index = Index::builder(3)
+        let index = Index::builder(3)
             .metric(DistanceMetric::Cosine)
             .build()
             .unwrap();
@@ -356,7 +387,7 @@ mod tests {
 
     #[test]
     fn test_larger_index() {
-        let mut index = Index::builder(128)
+        let index = Index::builder(128)
             .metric(DistanceMetric::Euclidean)
             .m(16)
             .ef_construction(100)
@@ -379,6 +410,40 @@ mod tests {
         // Results should be sorted by distance
         for i in 1..results.len() {
             assert!(results[i - 1].distance <= results[i].distance);
+        }
+    }
+
+    #[test]
+    fn test_mmap_persistence() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+
+        // Create and populate an index
+        {
+            let index = Index::builder(4)
+                .metric(DistanceMetric::Euclidean)
+                .m(8)
+                .capacity(100)
+                .build_mmap(&db_path)
+                .unwrap();
+
+            index.insert(1, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+            index.insert(2, &[0.0, 1.0, 0.0, 0.0]).unwrap();
+            index.insert(3, &[0.0, 0.0, 1.0, 0.0]).unwrap();
+            index.insert(4, &[0.0, 0.0, 0.0, 1.0]).unwrap();
+            index.flush().unwrap();
+        }
+
+        // Reopen and verify
+        {
+            let index = Index::open_mmap(&db_path).unwrap();
+            assert_eq!(index.len(), 4);
+
+            // Search should work immediately (graph was persisted)
+            let results = index.search(&[1.0, 0.0, 0.0, 0.0], 2).unwrap();
+            assert_eq!(results.len(), 2);
+            assert_eq!(results[0].id, 1);
+            assert!(results[0].distance < 0.001);
         }
     }
 }
