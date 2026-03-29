@@ -93,7 +93,6 @@ pub struct VectorMeta {
     pub _padding: u32,
 }
 
-#[allow(dead_code)]
 impl VectorMeta {
     pub fn new(id: u64, norm: f32) -> Self {
         Self {
@@ -110,6 +109,7 @@ impl VectorMeta {
         buf
     }
 
+    #[allow(dead_code)] // Part of the file format API
     pub fn from_bytes(buf: &[u8; 16]) -> Self {
         Self {
             id: u64::from_le_bytes(buf[0..8].try_into().unwrap()),

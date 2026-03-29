@@ -9,7 +9,7 @@ pub use memory::MemoryStorage;
 pub use mmap::MmapStorage;
 
 /// Trait for vector storage backends
-#[allow(dead_code)]
+#[allow(dead_code)] // Methods used through dynamic dispatch (dyn VectorStorage)
 pub trait VectorStorage: Send + Sync {
     /// Get vector dimensionality
     fn dimension(&self) -> usize;

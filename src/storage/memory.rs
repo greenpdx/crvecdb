@@ -7,7 +7,6 @@ use crate::error::{CrvecError, Result};
 use crate::storage::VectorStorage;
 
 /// In-memory vector storage optimized for parallel bulk loading
-#[allow(dead_code)]
 pub struct MemoryStorage {
     dimension: usize,
     capacity: usize,
@@ -24,7 +23,6 @@ pub struct MemoryStorage {
 unsafe impl Send for MemoryStorage {}
 unsafe impl Sync for MemoryStorage {}
 
-#[allow(dead_code)]
 impl MemoryStorage {
     pub fn new(config: &IndexConfig) -> Self {
         let capacity = config.capacity;
@@ -35,17 +33,6 @@ impl MemoryStorage {
             ids: UnsafeCell::new(vec![0; capacity]),
             norms: UnsafeCell::new(vec![0.0; capacity]),
             vectors: UnsafeCell::new(vec![0.0; capacity * config.dimension]),
-        }
-    }
-
-    pub fn with_capacity(dimension: usize, capacity: usize) -> Self {
-        Self {
-            dimension,
-            capacity,
-            len: AtomicUsize::new(0),
-            ids: UnsafeCell::new(vec![0; capacity]),
-            norms: UnsafeCell::new(vec![0.0; capacity]),
-            vectors: UnsafeCell::new(vec![0.0; capacity * dimension]),
         }
     }
 
@@ -62,7 +49,11 @@ impl MemoryStorage {
         let slot = self.len.fetch_add(1, Ordering::AcqRel) as InternalId;
 
         if slot as usize >= self.capacity {
-            return Err(CrvecError::InvalidFormat("capacity exceeded".into()));
+            // Roll back the increment to avoid corrupting the counter
+            self.len.fetch_sub(1, Ordering::AcqRel);
+            return Err(CrvecError::CapacityExceeded {
+                capacity: self.capacity,
+            });
         }
 
         let norm = l2_norm(vector);
@@ -82,10 +73,6 @@ impl MemoryStorage {
         Ok(slot)
     }
 
-    /// Get dimension
-    pub fn get_dimension(&self) -> usize {
-        self.dimension
-    }
 }
 
 impl VectorStorage for MemoryStorage {
@@ -139,7 +126,12 @@ mod tests {
 
     #[test]
     fn test_memory_storage() {
-        let mut storage = MemoryStorage::with_capacity(3, 100);
+        let config = crate::config::IndexConfig {
+            dimension: 3,
+            capacity: 100,
+            ..crate::config::IndexConfig::new(3)
+        };
+        let mut storage = MemoryStorage::new(&config);
 
         let id0 = storage.push(100, &[1.0, 2.0, 3.0]).unwrap();
         let id1 = storage.push(200, &[4.0, 5.0, 6.0]).unwrap();

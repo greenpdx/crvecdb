@@ -5,7 +5,7 @@ mod simd;
 use crate::config::DistanceMetric;
 
 /// Trait for distance/similarity metrics
-#[allow(dead_code)]
+#[allow(dead_code)] // Methods used through dynamic dispatch (dyn Distance)
 pub trait Distance: Send + Sync {
     /// Compute distance between two vectors (lower = more similar)
     fn distance(&self, a: &[f32], b: &[f32]) -> f32;

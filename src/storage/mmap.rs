@@ -12,15 +12,27 @@ use crate::storage::layout::{file_size, vector_stride, StorageHeader, VectorMeta
 use crate::storage::VectorStorage;
 
 /// Memory-mapped file storage (thread-safe)
+///
+/// SAFETY: The mmap is created with a fixed size at construction time and is never
+/// remapped. The `base_ptr` is stable for the lifetime of the `MmapStorage` because
+/// the `MmapMut` (held by `mmap`) keeps the mapping alive. Reads through `base_ptr`
+/// are safe as long as we only read slots that have already been written (guaranteed
+/// by `count` being updated after the write completes).
 pub struct MmapStorage {
-    #[allow(dead_code)]
-    file: File,
+    _file: File,
     mmap: RwLock<MmapMut>,
+    /// Stable pointer to the start of the mmap region, used for lock-free reads.
+    base_ptr: *const u8,
     dimension: usize,
     stride: usize,
     count: AtomicUsize,
     capacity: AtomicUsize,
 }
+
+// SAFETY: base_ptr points into the mmap which is pinned for the lifetime of this struct.
+// Concurrent reads of already-written slots are safe. Writes go through the RwLock.
+unsafe impl Send for MmapStorage {}
+unsafe impl Sync for MmapStorage {}
 
 impl MmapStorage {
     /// Create new mmap storage at path
@@ -46,9 +58,12 @@ impl MmapStorage {
         mmap[0..64].copy_from_slice(&header.to_bytes());
         mmap.flush()?;
 
+        let base_ptr = mmap.as_ptr();
+
         Ok(Self {
-            file,
+            _file: file,
             mmap: RwLock::new(mmap),
+            base_ptr,
             dimension,
             stride,
             count: AtomicUsize::new(0),
@@ -69,10 +84,12 @@ impl MmapStorage {
 
         let dimension = header.dimension as usize;
         let stride = vector_stride(dimension);
+        let base_ptr = mmap.as_ptr();
 
         Ok(Self {
-            file,
+            _file: file,
             mmap: RwLock::new(mmap),
+            base_ptr,
             dimension,
             stride,
             count: AtomicUsize::new(header.count as usize),
@@ -93,9 +110,8 @@ impl MmapStorage {
         let count = self.count.load(Ordering::Acquire);
         let capacity = self.capacity.load(Ordering::Acquire);
 
-        // For now, don't support growing in thread-safe mode
         if count >= capacity {
-            return Err(CrvecError::InvalidFormat("capacity exceeded".into()));
+            return Err(CrvecError::CapacityExceeded { capacity });
         }
 
         let internal_id = count as InternalId;
@@ -135,30 +151,35 @@ impl VectorStorage for MmapStorage {
     }
 
     fn push(&mut self, id: VectorId, vector: &[f32]) -> Result<InternalId> {
-        // Delegate to thread-safe version
         self.push_sync(id, vector)
     }
 
     fn get_vector(&self, internal_id: InternalId) -> &[f32] {
         let offset = 64 + (internal_id as usize) * self.stride + 16;
-        let mmap = self.mmap.read();
-        // SAFETY: mmap is pinned in memory as long as file exists
+        // SAFETY: base_ptr is stable (mmap is never remapped), and this slot
+        // has been written before count was incremented, so the data is valid.
         unsafe {
-            let ptr = mmap[offset..].as_ptr() as *const f32;
+            let ptr = self.base_ptr.add(offset) as *const f32;
             std::slice::from_raw_parts(ptr, self.dimension)
         }
     }
 
     fn get_id(&self, internal_id: InternalId) -> VectorId {
         let offset = 64 + (internal_id as usize) * self.stride;
-        let mmap = self.mmap.read();
-        u64::from_le_bytes(mmap[offset..offset + 8].try_into().unwrap())
+        // SAFETY: same as get_vector
+        unsafe {
+            let ptr = self.base_ptr.add(offset) as *const u64;
+            ptr.read_unaligned()
+        }
     }
 
     fn get_norm(&self, internal_id: InternalId) -> f32 {
         let offset = 64 + (internal_id as usize) * self.stride + 8;
-        let mmap = self.mmap.read();
-        f32::from_le_bytes(mmap[offset..offset + 4].try_into().unwrap())
+        // SAFETY: same as get_vector
+        unsafe {
+            let ptr = self.base_ptr.add(offset) as *const f32;
+            ptr.read_unaligned()
+        }
     }
 
     fn flush(&self) -> Result<()> {

@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 /// Scalar dot product (fallback)
 #[inline]
 pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
@@ -42,6 +40,7 @@ pub fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
 
 /// Scalar cosine distance with precomputed norm_a
 #[inline]
+#[allow(dead_code)] // Used when simd feature is disabled, called from distance/mod.rs
 pub fn cosine_distance_with_norm(a: &[f32], b: &[f32], norm_a: f32) -> f32 {
     let dot = dot_product(a, b);
     let norm_b = l2_norm(b);

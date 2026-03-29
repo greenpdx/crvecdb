@@ -37,6 +37,8 @@ pub struct HnswConfig {
     pub m0: usize,
     /// Search width during construction
     pub ef_construction: usize,
+    /// Search width at query time
+    pub ef_search: usize,
     /// Layer probability factor: 1/ln(M)
     pub ml: f64,
 }
@@ -48,6 +50,7 @@ impl Default for HnswConfig {
             m,
             m0: m * 2,
             ef_construction: 200,
+            ef_search: 64,
             ml: 1.0 / (m as f64).ln(),
         }
     }
@@ -60,6 +63,7 @@ impl HnswConfig {
             m,
             m0: m * 2,
             ef_construction: 200,
+            ef_search: 64,
             ml: 1.0 / (m as f64).ln(),
         }
     }

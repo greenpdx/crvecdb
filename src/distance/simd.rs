@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use simdeez::prelude::*;
 
 simd_runtime_generate!(

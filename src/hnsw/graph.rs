@@ -3,7 +3,7 @@ use std::collections::BinaryHeap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ordered_float::OrderedFloat;
 use parking_lot::RwLock;
@@ -20,8 +20,19 @@ pub const MAX_LAYERS: usize = 16;
 /// Sentinel value for no entry point
 const NO_ENTRY_POINT: u32 = u32::MAX;
 
+/// Pack entry_point (low 32 bits) and max_level (high 32 bits) into a u64
+fn pack_entry_state(entry_point: u32, max_level: u32) -> u64 {
+    (entry_point as u64) | ((max_level as u64) << 32)
+}
+
+/// Unpack entry_point and max_level from a u64
+fn unpack_entry_state(state: u64) -> (u32, u32) {
+    let entry_point = state as u32;
+    let max_level = (state >> 32) as u32;
+    (entry_point, max_level)
+}
+
 /// A node in the HNSW graph
-#[allow(dead_code)]
 pub struct HnswNode {
     /// Maximum layer this node exists on
     pub max_layer: usize,
@@ -47,10 +58,8 @@ impl HnswNode {
 pub struct HnswGraph {
     /// Nodes indexed by InternalId
     pub nodes: RwLock<Vec<HnswNode>>,
-    /// Entry point (highest layer node), NO_ENTRY_POINT if none
-    entry_point: AtomicU32,
-    /// Current maximum layer
-    max_level: AtomicUsize,
+    /// Packed entry_point (low 32) + max_level (high 32), atomically updated
+    entry_state: AtomicU64,
     /// Configuration
     pub config: HnswConfig,
 }
@@ -59,15 +68,14 @@ impl HnswGraph {
     pub fn new(config: HnswConfig) -> Self {
         Self {
             nodes: RwLock::new(Vec::new()),
-            entry_point: AtomicU32::new(NO_ENTRY_POINT),
-            max_level: AtomicUsize::new(0),
+            entry_state: AtomicU64::new(pack_entry_state(NO_ENTRY_POINT, 0)),
             config,
         }
     }
 
     /// Get current entry point
     pub fn get_entry_point(&self) -> Option<InternalId> {
-        let ep = self.entry_point.load(Ordering::Acquire);
+        let (ep, _) = unpack_entry_state(self.entry_state.load(Ordering::Acquire));
         if ep == NO_ENTRY_POINT {
             None
         } else {
@@ -77,7 +85,15 @@ impl HnswGraph {
 
     /// Get current max level
     pub fn get_max_level(&self) -> usize {
-        self.max_level.load(Ordering::Acquire)
+        let (_, ml) = unpack_entry_state(self.entry_state.load(Ordering::Acquire));
+        ml as usize
+    }
+
+    /// Get entry point and max level atomically
+    fn get_entry_state(&self) -> (Option<InternalId>, usize) {
+        let (ep, ml) = unpack_entry_state(self.entry_state.load(Ordering::Acquire));
+        let entry = if ep == NO_ENTRY_POINT { None } else { Some(ep) };
+        (entry, ml as usize)
     }
 
     /// Get number of nodes
@@ -114,41 +130,37 @@ impl HnswGraph {
             let mut nodes = self.nodes.write();
             // Ensure we have space up to this ID
             while nodes.len() <= internal_id as usize {
-                // This shouldn't happen in normal use, but handle it
                 nodes.push(HnswNode::new(0, &self.config));
             }
             nodes[internal_id as usize] = node;
         }
 
-        // Try to become the first entry point
+        // Try to become the first entry point (atomic CAS on packed state)
+        let initial_state = pack_entry_state(NO_ENTRY_POINT, 0);
+        let new_state = pack_entry_state(internal_id, insert_level as u32);
         if self
-            .entry_point
-            .compare_exchange(
-                NO_ENTRY_POINT,
-                internal_id,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
+            .entry_state
+            .compare_exchange(initial_state, new_state, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            self.max_level.store(insert_level, Ordering::Release);
             return;
         }
 
         let query = storage.get_vector(internal_id);
-        let mut current = self.entry_point.load(Ordering::Acquire);
-        let current_max_level = self.max_level.load(Ordering::Acquire);
+        let (_, current_max_level) = self.get_entry_state();
+        let mut current = self.entry_state.load(Ordering::Acquire);
+        let (mut current_ep, _) = unpack_entry_state(current);
 
         // Phase 1: Traverse from top to insert_level + 1 with greedy search
         for level in (insert_level + 1..=current_max_level).rev() {
-            current = self.search_layer_single(query, current, level, storage, distance);
+            current_ep = self.search_layer_single(query, current_ep, level, storage, distance);
         }
 
         // Phase 2: Insert at levels insert_level down to 0
         let top_level = insert_level.min(current_max_level);
         for level in (0..=top_level).rev() {
             let candidates =
-                self.search_layer(query, current, self.config.ef_construction, level, storage, distance);
+                self.search_layer(query, current_ep, self.config.ef_construction, level, storage, distance);
 
             let max_neighbors = if level == 0 {
                 self.config.m0
@@ -187,22 +199,23 @@ impl HnswGraph {
 
             // Update entry point for next level
             if let Some(&nearest) = selected.first() {
-                current = nearest;
+                current_ep = nearest;
             }
         }
 
-        // Update entry point if new node has higher level (CAS loop)
+        // Update entry point if new node has higher level (CAS loop on packed state)
         loop {
-            let old_max = self.max_level.load(Ordering::Acquire);
-            if insert_level <= old_max {
+            current = self.entry_state.load(Ordering::Acquire);
+            let (_, old_max) = unpack_entry_state(current);
+            if insert_level <= old_max as usize {
                 break;
             }
+            let new_state = pack_entry_state(internal_id, insert_level as u32);
             if self
-                .max_level
-                .compare_exchange(old_max, insert_level, Ordering::AcqRel, Ordering::Acquire)
+                .entry_state
+                .compare_exchange(current, new_state, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                self.entry_point.store(internal_id, Ordering::Release);
                 break;
             }
         }
@@ -257,8 +270,9 @@ impl HnswGraph {
         distance: &dyn Distance,
     ) -> Vec<(f32, InternalId)> {
         let num_nodes = self.nodes.read().len();
-        let mut visited = vec![false; num_nodes.max(entry as usize + 1)];
-        visited[entry as usize] = true;
+        let num_words = (num_nodes.max(entry as usize + 1) + 63) / 64;
+        let mut visited = vec![0u64; num_words];
+        visited[entry as usize / 64] |= 1u64 << (entry as usize % 64);
 
         let entry_dist = distance.distance(query, storage.get_vector(entry));
 
@@ -285,13 +299,17 @@ impl HnswGraph {
             };
 
             for neighbor_id in neighbor_ids {
-                if neighbor_id as usize >= visited.len() {
-                    visited.resize(neighbor_id as usize + 1, false);
+                let idx = neighbor_id as usize;
+                // Grow visited bitset if needed
+                if idx / 64 >= visited.len() {
+                    visited.resize(idx / 64 + 1, 0);
                 }
-                if visited[neighbor_id as usize] {
+                let word = idx / 64;
+                let bit = 1u64 << (idx % 64);
+                if visited[word] & bit != 0 {
                     continue;
                 }
-                visited[neighbor_id as usize] = true;
+                visited[word] |= bit;
 
                 let neighbor_dist = distance.distance(query, storage.get_vector(neighbor_id));
                 let worst_dist = results.peek().map(|(d, _)| d.0).unwrap_or(f32::MAX);
@@ -375,14 +393,16 @@ impl HnswGraph {
         let file = File::create(path)?;
         let mut writer = BufWriter::new(file);
 
+        let (entry_point, max_level) = unpack_entry_state(self.entry_state.load(Ordering::Acquire));
+
         // Magic
         writer.write_all(b"HNSW")?;
         // Version
         writer.write_all(&1u32.to_le_bytes())?;
         // Entry point
-        writer.write_all(&self.entry_point.load(Ordering::Acquire).to_le_bytes())?;
+        writer.write_all(&entry_point.to_le_bytes())?;
         // Max level
-        writer.write_all(&(self.max_level.load(Ordering::Acquire) as u32).to_le_bytes())?;
+        writer.write_all(&max_level.to_le_bytes())?;
         // M and M0
         writer.write_all(&(self.config.m as u32).to_le_bytes())?;
         writer.write_all(&(self.config.m0 as u32).to_le_bytes())?;
@@ -436,7 +456,7 @@ impl HnswGraph {
 
         // Max level
         reader.read_exact(&mut buf4)?;
-        let max_level = u32::from_le_bytes(buf4) as usize;
+        let max_level = u32::from_le_bytes(buf4);
 
         // M and M0
         reader.read_exact(&mut buf4)?;
@@ -452,6 +472,7 @@ impl HnswGraph {
             m,
             m0,
             ef_construction: 200,
+            ef_search: 64,
             ml: 1.0 / (m as f64).ln(),
         };
 
@@ -484,8 +505,7 @@ impl HnswGraph {
 
         Ok(Self {
             nodes: RwLock::new(nodes),
-            entry_point: AtomicU32::new(entry_point),
-            max_level: AtomicUsize::new(max_level),
+            entry_state: AtomicU64::new(pack_entry_state(entry_point, max_level)),
             config,
         })
     }

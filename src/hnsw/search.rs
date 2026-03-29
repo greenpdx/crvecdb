@@ -103,8 +103,9 @@ impl HnswGraph {
         distance: &dyn Distance,
     ) -> Vec<(f32, InternalId)> {
         let num_nodes = self.nodes.read().len();
-        let mut visited = vec![false; num_nodes];
-        visited[entry as usize] = true;
+        let num_words = (num_nodes + 63) / 64;
+        let mut visited = vec![0u64; num_words];
+        visited[entry as usize / 64] |= 1u64 << (entry as usize % 64);
 
         let entry_dist = distance.distance(query, storage.get_vector(entry));
 
@@ -129,13 +130,17 @@ impl HnswGraph {
             };
 
             for neighbor_id in neighbor_ids {
-                if neighbor_id as usize >= visited.len() {
-                    visited.resize(neighbor_id as usize + 1, false);
+                let idx = neighbor_id as usize;
+                // Grow visited bitset if needed
+                if idx / 64 >= visited.len() {
+                    visited.resize(idx / 64 + 1, 0);
                 }
-                if visited[neighbor_id as usize] {
+                let word = idx / 64;
+                let bit = 1u64 << (idx % 64);
+                if visited[word] & bit != 0 {
                     continue;
                 }
-                visited[neighbor_id as usize] = true;
+                visited[word] |= bit;
 
                 let neighbor_dist = distance.distance(query, storage.get_vector(neighbor_id));
                 let worst_dist = results.peek().map(|(d, _)| d.0).unwrap_or(f32::MAX);

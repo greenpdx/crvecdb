@@ -1,10 +1,12 @@
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
+use parking_lot::RwLock;
 
-use crate::config::{DistanceMetric, HnswConfig, IndexConfig, VectorId};
+use crate::config::{DistanceMetric, HnswConfig, IndexConfig, InternalId, VectorId};
 use crate::distance::{create_distance, Distance};
 use crate::error::{CrvecError, Result};
 use crate::hnsw::{HnswGraph, SearchResult};
@@ -38,6 +40,12 @@ impl IndexBuilder {
     /// Set ef_construction parameter
     pub fn ef_construction(mut self, ef: usize) -> Self {
         self.config.hnsw.ef_construction = ef;
+        self
+    }
+
+    /// Set ef_search parameter (search width at query time, default 64)
+    pub fn ef_search(mut self, ef: usize) -> Self {
+        self.config.hnsw.ef_search = ef;
         self
     }
 
@@ -149,6 +157,10 @@ pub struct Index {
     graph: HnswGraph,
     distance: Arc<dyn Distance>,
     config: IndexConfig,
+    /// Reverse mapping from external VectorId to InternalId
+    id_map: RwLock<HashMap<VectorId, InternalId>>,
+    /// Set of soft-deleted internal IDs
+    deleted: RwLock<HashSet<InternalId>>,
 }
 
 impl Index {
@@ -168,6 +180,8 @@ impl Index {
             graph,
             distance,
             config,
+            id_map: RwLock::new(HashMap::new()),
+            deleted: RwLock::new(HashSet::new()),
         })
     }
 
@@ -182,6 +196,8 @@ impl Index {
             graph,
             distance,
             config,
+            id_map: RwLock::new(HashMap::new()),
+            deleted: RwLock::new(HashSet::new()),
         })
     }
 
@@ -216,11 +232,22 @@ impl Index {
 
         let distance: Arc<dyn Distance> = Arc::from(create_distance(config.metric));
 
+        // Rebuild id_map from storage
+        let count = storage.len();
+        let mut id_map = HashMap::with_capacity(count);
+        for i in 0..count {
+            let internal_id = i as InternalId;
+            let vector_id = storage.get_id(internal_id);
+            id_map.insert(vector_id, internal_id);
+        }
+
         Ok(Self {
             storage: StorageBackend::Mmap { storage, path: path.to_path_buf() },
             graph,
             distance,
             config,
+            id_map: RwLock::new(id_map),
+            deleted: RwLock::new(HashSet::new()),
         })
     }
 
@@ -234,6 +261,7 @@ impl Index {
         }
 
         let internal_id = self.storage.push_sync(id, vector)?;
+        self.id_map.write().insert(id, internal_id);
         self.graph
             .insert(internal_id, &self.storage, self.distance.as_ref());
 
@@ -268,6 +296,7 @@ impl Index {
             // Storage uses atomic slot allocation, so each thread gets unique slots
             vectors.par_iter().try_for_each(|(id, vector)| {
                 let internal_id = self.storage.push_sync(*id, vector)?;
+                self.id_map.write().insert(*id, internal_id);
                 self.graph
                     .insert(internal_id, &self.storage, self.distance.as_ref());
                 Ok::<_, CrvecError>(())
@@ -279,6 +308,7 @@ impl Index {
             // Sequential fallback
             for (id, vector) in vectors {
                 let internal_id = self.storage.push_sync(*id, vector)?;
+                self.id_map.write().insert(*id, internal_id);
                 self.graph
                     .insert(internal_id, &self.storage, self.distance.as_ref());
             }
@@ -289,7 +319,7 @@ impl Index {
 
     /// Search for k nearest neighbors
     pub fn search(&self, query: &[f32], k: usize) -> Result<Vec<SearchResult>> {
-        self.search_with_ef(query, k, self.config.hnsw.ef_construction)
+        self.search_with_ef(query, k, self.config.hnsw.ef_search)
     }
 
     /// Search with custom ef_search parameter
@@ -306,11 +336,33 @@ impl Index {
             });
         }
 
+        // Over-fetch to account for deleted nodes, then filter
+        let deleted = self.deleted.read();
+        if deleted.is_empty() {
+            let results =
+                self.graph
+                    .search(query, k, ef_search, &self.storage, self.distance.as_ref());
+            return Ok(results);
+        }
+
+        // Request more candidates to compensate for filtered deletions
+        let fetch_k = k + deleted.len().min(k);
         let results =
             self.graph
-                .search(query, k, ef_search, &self.storage, self.distance.as_ref());
+                .search(query, fetch_k, ef_search.max(fetch_k), &self.storage, self.distance.as_ref());
 
-        Ok(results)
+        Ok(results
+            .into_iter()
+            .filter(|r| {
+                // Look up internal ID to check deletion status
+                if let Some(&internal_id) = self.id_map.read().get(&r.id) {
+                    !deleted.contains(&internal_id)
+                } else {
+                    true
+                }
+            })
+            .take(k)
+            .collect())
     }
 
     /// Get number of vectors in index
@@ -326,6 +378,49 @@ impl Index {
     /// Get vector dimension
     pub fn dimension(&self) -> usize {
         self.config.dimension
+    }
+
+    /// Get the index configuration
+    pub fn config(&self) -> &IndexConfig {
+        &self.config
+    }
+
+    /// Check if a vector ID exists in the index (and is not deleted)
+    pub fn contains(&self, id: VectorId) -> bool {
+        let id_map = self.id_map.read();
+        match id_map.get(&id) {
+            Some(&internal_id) => !self.deleted.read().contains(&internal_id),
+            None => false,
+        }
+    }
+
+    /// Get the vector data for a given vector ID
+    pub fn get_vector(&self, id: VectorId) -> Result<Vec<f32>> {
+        let id_map = self.id_map.read();
+        match id_map.get(&id) {
+            Some(&internal_id) => {
+                if self.deleted.read().contains(&internal_id) {
+                    return Err(CrvecError::NotFound(id));
+                }
+                Ok(self.storage.get_vector(internal_id).to_vec())
+            }
+            None => Err(CrvecError::NotFound(id)),
+        }
+    }
+
+    /// Soft-delete a vector by ID
+    ///
+    /// The vector remains in the graph for traversal but is excluded from
+    /// search results. This is the standard HNSW approach to deletion.
+    pub fn delete(&self, id: VectorId) -> Result<()> {
+        let id_map = self.id_map.read();
+        match id_map.get(&id) {
+            Some(&internal_id) => {
+                self.deleted.write().insert(internal_id);
+                Ok(())
+            }
+            None => Err(CrvecError::NotFound(id)),
+        }
     }
 
     /// Flush to disk (for mmap storage)
