@@ -25,14 +25,17 @@ impl HnswGraph {
         storage: &dyn VectorStorage,
         distance: &dyn Distance,
     ) -> Vec<SearchResult> {
-        let entry_point = match self.get_entry_point() {
-            Some(ep) => ep,
-            None => return Vec::new(),
+        // Atomic read of the (entry_point, max_level) pair. Reading them
+        // separately lets a concurrent insert CAS pair an old entry point
+        // with a new max_level, which then indexes past
+        // `entry_point.neighbors` and panics.
+        let (entry_point, max_level) = match self.get_entry_state() {
+            (Some(ep), ml) => (ep, ml),
+            (None, _) => return Vec::new(),
         };
 
         let ef = ef_search.max(k);
         let mut current = entry_point;
-        let max_level = self.get_max_level();
 
         // Phase 1: Traverse top layers with greedy search
         for level in (1..=max_level).rev() {

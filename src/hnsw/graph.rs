@@ -73,24 +73,8 @@ impl HnswGraph {
         }
     }
 
-    /// Get current entry point
-    pub fn get_entry_point(&self) -> Option<InternalId> {
-        let (ep, _) = unpack_entry_state(self.entry_state.load(Ordering::Acquire));
-        if ep == NO_ENTRY_POINT {
-            None
-        } else {
-            Some(ep)
-        }
-    }
-
-    /// Get current max level
-    pub fn get_max_level(&self) -> usize {
-        let (_, ml) = unpack_entry_state(self.entry_state.load(Ordering::Acquire));
-        ml as usize
-    }
-
     /// Get entry point and max level atomically
-    fn get_entry_state(&self) -> (Option<InternalId>, usize) {
+    pub(crate) fn get_entry_state(&self) -> (Option<InternalId>, usize) {
         let (ep, ml) = unpack_entry_state(self.entry_state.load(Ordering::Acquire));
         let entry = if ep == NO_ENTRY_POINT { None } else { Some(ep) };
         (entry, ml as usize)
@@ -147,9 +131,14 @@ impl HnswGraph {
         }
 
         let query = storage.get_vector(internal_id);
-        let (_, current_max_level) = self.get_entry_state();
-        let mut current = self.entry_state.load(Ordering::Acquire);
-        let (mut current_ep, _) = unpack_entry_state(current);
+        // Atomic read of the (entry_point, max_level) pair — reading these
+        // separately lets a concurrent CAS pair an old entry point with a new
+        // max_level, which then indexes past `entry_point.neighbors`.
+        let (ep_opt, current_max_level) = self.get_entry_state();
+        let mut current_ep = match ep_opt {
+            Some(ep) => ep,
+            None => return,
+        };
 
         // Phase 1: Traverse from top to insert_level + 1 with greedy search
         for level in (insert_level + 1..=current_max_level).rev() {
@@ -205,7 +194,7 @@ impl HnswGraph {
 
         // Update entry point if new node has higher level (CAS loop on packed state)
         loop {
-            current = self.entry_state.load(Ordering::Acquire);
+            let current = self.entry_state.load(Ordering::Acquire);
             let (_, old_max) = unpack_entry_state(current);
             if insert_level <= old_max as usize {
                 break;
