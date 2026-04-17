@@ -56,6 +56,12 @@ impl HnswGraph {
             .collect()
     }
 
+    fn get_node(&self, id: InternalId) -> &crate::hnsw::graph::HnswNode {
+        self.nodes[id as usize]
+            .get()
+            .expect("HNSW internal: accessed an uninitialized node slot")
+    }
+
     /// Greedy search for single nearest at a layer
     fn search_layer_greedy(
         &self,
@@ -69,10 +75,8 @@ impl HnswGraph {
         let mut current_dist = distance.distance(query, storage.get_vector(entry));
 
         loop {
-            let neighbor_ids: Vec<InternalId> = {
-                let nodes = self.nodes.read();
-                nodes[current as usize].neighbors[level].read().clone()
-            };
+            let neighbor_ids: Vec<InternalId> =
+                self.get_node(current).neighbors[level].read().clone();
             let mut improved = false;
             let mut best = current;
             let mut best_dist = current_dist;
@@ -105,8 +109,8 @@ impl HnswGraph {
         storage: &dyn VectorStorage,
         distance: &dyn Distance,
     ) -> Vec<(f32, InternalId)> {
-        let num_nodes = self.nodes.read().len();
-        let num_words = (num_nodes + 63) / 64;
+        let capacity = self.nodes.len();
+        let num_words = (capacity.max(entry as usize + 1) + 63) / 64;
         let mut visited = vec![0u64; num_words];
         visited[entry as usize / 64] |= 1u64 << (entry as usize % 64);
 
@@ -127,10 +131,8 @@ impl HnswGraph {
                 break;
             }
 
-            let neighbor_ids: Vec<InternalId> = {
-                let nodes = self.nodes.read();
-                nodes[c_id as usize].neighbors[0].read().clone()
-            };
+            let neighbor_ids: Vec<InternalId> =
+                self.get_node(c_id).neighbors[0].read().clone();
 
             for neighbor_id in neighbor_ids {
                 let idx = neighbor_id as usize;

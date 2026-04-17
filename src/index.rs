@@ -172,7 +172,7 @@ impl Index {
     /// Create in-memory index
     pub fn new_memory(config: IndexConfig) -> Result<Self> {
         let storage = MemoryStorage::new(&config);
-        let graph = HnswGraph::new(config.hnsw);
+        let graph = HnswGraph::new(config.hnsw, config.capacity);
         let distance: Arc<dyn Distance> = Arc::from(create_distance(config.metric));
 
         Ok(Self {
@@ -188,7 +188,7 @@ impl Index {
     /// Create memory-mapped index
     pub fn new_mmap(config: IndexConfig, path: &Path) -> Result<Self> {
         let storage = MmapStorage::create(path, &config)?;
-        let graph = HnswGraph::new(config.hnsw);
+        let graph = HnswGraph::new(config.hnsw, config.capacity);
         let distance: Arc<dyn Distance> = Arc::from(create_distance(config.metric));
 
         Ok(Self {
@@ -220,7 +220,7 @@ impl Index {
             (loaded_graph, config)
         } else {
             let config = HnswConfig::default();
-            (HnswGraph::new(config), config)
+            (HnswGraph::new(config, header.capacity as usize), config)
         };
 
         let config = IndexConfig {

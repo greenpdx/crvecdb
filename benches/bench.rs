@@ -7,7 +7,7 @@ fn bench_insert(c: &mut Criterion) {
     for dim in [128, 384, 768] {
         group.bench_with_input(BenchmarkId::new("dimension", dim), &dim, |b, &dim| {
             b.iter(|| {
-                let mut index = Index::builder(dim)
+                let index = Index::builder(dim)
                     .metric(DistanceMetric::Euclidean)
                     .m(16)
                     .ef_construction(100)
@@ -31,7 +31,7 @@ fn bench_search(c: &mut Criterion) {
 
     for size in [1000, 10000] {
         // Build index once
-        let mut index = Index::builder(128)
+        let index = Index::builder(128)
             .metric(DistanceMetric::Euclidean)
             .m(16)
             .ef_construction(200)

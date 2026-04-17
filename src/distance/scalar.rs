@@ -7,6 +7,7 @@ pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
 
 /// Scalar squared Euclidean distance
 #[inline]
+#[allow(dead_code)] // Used when simd feature is disabled, called from distance/mod.rs
 pub fn squared_euclidean(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
     a.iter()
@@ -26,6 +27,7 @@ pub fn l2_norm(v: &[f32]) -> f32 {
 
 /// Scalar cosine distance
 #[inline]
+#[allow(dead_code)] // Used when simd feature is disabled, called from distance/mod.rs
 pub fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
     let dot = dot_product(a, b);
     let norm_a = l2_norm(a);

@@ -3,6 +3,7 @@ use std::collections::BinaryHeap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ordered_float::OrderedFloat;
@@ -19,6 +20,9 @@ pub const MAX_LAYERS: usize = 16;
 
 /// Sentinel value for no entry point
 const NO_ENTRY_POINT: u32 = u32::MAX;
+
+/// Graph file format version.
+const GRAPH_FORMAT_VERSION: u32 = 2;
 
 /// Pack entry_point (low 32 bits) and max_level (high 32 bits) into a u64
 fn pack_entry_state(entry_point: u32, max_level: u32) -> u64 {
@@ -55,9 +59,16 @@ impl HnswNode {
 }
 
 /// The HNSW graph structure (thread-safe)
+///
+/// `nodes` is pre-allocated to the index's capacity and never grows. Each slot
+/// is a `OnceLock<HnswNode>` that is populated exactly once during `insert()`.
+/// This removes the need for an outer `RwLock` on the `nodes` vector: readers
+/// and concurrent inserters never contend on it, and a slot can never be
+/// replaced while a reader is looking at it.
 pub struct HnswGraph {
-    /// Nodes indexed by InternalId
-    pub nodes: RwLock<Vec<HnswNode>>,
+    /// Pre-allocated slots, one per possible `InternalId`. Each slot is set
+    /// exactly once when the corresponding node is inserted.
+    pub nodes: Vec<OnceLock<HnswNode>>,
     /// Packed entry_point (low 32) + max_level (high 32), atomically updated
     entry_state: AtomicU64,
     /// Configuration
@@ -65,12 +76,26 @@ pub struct HnswGraph {
 }
 
 impl HnswGraph {
-    pub fn new(config: HnswConfig) -> Self {
+    pub fn new(config: HnswConfig, capacity: usize) -> Self {
+        let mut nodes = Vec::with_capacity(capacity);
+        for _ in 0..capacity {
+            nodes.push(OnceLock::new());
+        }
         Self {
-            nodes: RwLock::new(Vec::new()),
+            nodes,
             entry_state: AtomicU64::new(pack_entry_state(NO_ENTRY_POINT, 0)),
             config,
         }
+    }
+
+    /// Borrow the node at `id`. Panics if the slot has not been inserted yet;
+    /// by construction every id we traverse is reachable from a completed
+    /// insert, so a missing slot is a logic bug.
+    #[inline]
+    fn node(&self, id: InternalId) -> &HnswNode {
+        self.nodes[id as usize]
+            .get()
+            .expect("HNSW internal: accessed an uninitialized node slot")
     }
 
     /// Get entry point and max level atomically
@@ -80,15 +105,15 @@ impl HnswGraph {
         (entry, ml as usize)
     }
 
-    /// Get number of nodes
+    /// Get number of populated nodes.
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
-        self.nodes.read().len()
+        self.nodes.iter().filter(|s| s.get().is_some()).count()
     }
 
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
-        self.nodes.read().is_empty()
+        self.nodes.iter().all(|s| s.get().is_none())
     }
 
     /// Generate random level for new node
@@ -109,15 +134,12 @@ impl HnswGraph {
         let insert_level = self.random_level();
         let node = HnswNode::new(insert_level, &self.config);
 
-        // Add node to the graph first
-        {
-            let mut nodes = self.nodes.write();
-            // Ensure we have space up to this ID
-            while nodes.len() <= internal_id as usize {
-                nodes.push(HnswNode::new(0, &self.config));
-            }
-            nodes[internal_id as usize] = node;
-        }
+        // Populate our slot exactly once. If it's already set, that's a caller
+        // bug (duplicate internal_id) — panic loudly rather than corrupt state.
+        self.nodes[internal_id as usize]
+            .set(node)
+            .map_err(|_| ())
+            .expect("HNSW internal: insert called twice for the same internal_id");
 
         // Try to become the first entry point (atomic CAS on packed state)
         let initial_state = pack_entry_state(NO_ENTRY_POINT, 0);
@@ -159,17 +181,18 @@ impl HnswGraph {
 
             let selected = self.select_neighbors_simple(&candidates, max_neighbors);
 
-            // Add connections from new node to selected neighbors
+            // Add connections from new node to selected neighbors.
+            // Our own slot was set above, so .get() returns Some here.
             {
-                let nodes = self.nodes.read();
-                let mut new_node_neighbors = nodes[internal_id as usize].neighbors[level].write();
+                let mut new_node_neighbors = self.node(internal_id).neighbors[level].write();
                 *new_node_neighbors = selected.clone();
             }
 
-            // Add reverse connections
+            // Add reverse connections. Each neighbor_id came from a completed
+            // traversal at this layer, so its slot is populated and its
+            // neighbors vec has at least `level + 1` layers.
             for &neighbor_id in &selected {
-                let nodes = self.nodes.read();
-                let mut neighbor_neighbors = nodes[neighbor_id as usize].neighbors[level].write();
+                let mut neighbor_neighbors = self.node(neighbor_id).neighbors[level].write();
 
                 if neighbor_neighbors.len() < max_neighbors {
                     neighbor_neighbors.push(internal_id);
@@ -223,8 +246,7 @@ impl HnswGraph {
         let mut current_dist = distance.distance(query, storage.get_vector(entry));
 
         loop {
-            let nodes = self.nodes.read();
-            let neighbors = nodes[current as usize].neighbors[level].read();
+            let neighbors = self.node(current).neighbors[level].read();
             let mut improved = false;
             let mut best = current;
             let mut best_dist = current_dist;
@@ -237,6 +259,8 @@ impl HnswGraph {
                     improved = true;
                 }
             }
+
+            drop(neighbors);
 
             if !improved {
                 break;
@@ -258,8 +282,7 @@ impl HnswGraph {
         storage: &dyn VectorStorage,
         distance: &dyn Distance,
     ) -> Vec<(f32, InternalId)> {
-        let num_nodes = self.nodes.read().len();
-        let num_words = (num_nodes.max(entry as usize + 1) + 63) / 64;
+        let num_words = (self.nodes.len().max(entry as usize + 1) + 63) / 64;
         let mut visited = vec![0u64; num_words];
         visited[entry as usize / 64] |= 1u64 << (entry as usize % 64);
 
@@ -281,11 +304,8 @@ impl HnswGraph {
                 break;
             }
 
-            // Get neighbors for this node
-            let neighbor_ids: Vec<InternalId> = {
-                let nodes = self.nodes.read();
-                nodes[c_id as usize].neighbors[level].read().clone()
-            };
+            // Snapshot this node's neighbors at this level
+            let neighbor_ids: Vec<InternalId> = self.node(c_id).neighbors[level].read().clone();
 
             for neighbor_id in neighbor_ids {
                 let idx = neighbor_id as usize;
@@ -365,15 +385,17 @@ impl HnswGraph {
 
     /// Save graph to file
     ///
-    /// File format:
+    /// File format (version 2):
     /// - Magic: 4 bytes "HNSW"
-    /// - Version: 4 bytes (1)
+    /// - Version: 4 bytes (2)
     /// - Entry point: 4 bytes (u32, NO_ENTRY_POINT if none)
     /// - Max level: 4 bytes (u32)
     /// - M: 4 bytes (u32)
     /// - M0: 4 bytes (u32)
-    /// - Num nodes: 4 bytes (u32)
-    /// - For each node:
+    /// - Capacity: 4 bytes (u32)
+    /// - Num populated: 4 bytes (u32)
+    /// - For each populated node:
+    ///   - id: 4 bytes (u32)
     ///   - max_layer: 1 byte
     ///   - For each layer 0..=max_layer:
     ///     - num_neighbors: 2 bytes (u16)
@@ -384,28 +406,28 @@ impl HnswGraph {
 
         let (entry_point, max_level) = unpack_entry_state(self.entry_state.load(Ordering::Acquire));
 
-        // Magic
         writer.write_all(b"HNSW")?;
-        // Version
-        writer.write_all(&1u32.to_le_bytes())?;
-        // Entry point
+        writer.write_all(&GRAPH_FORMAT_VERSION.to_le_bytes())?;
         writer.write_all(&entry_point.to_le_bytes())?;
-        // Max level
         writer.write_all(&max_level.to_le_bytes())?;
-        // M and M0
         writer.write_all(&(self.config.m as u32).to_le_bytes())?;
         writer.write_all(&(self.config.m0 as u32).to_le_bytes())?;
+        writer.write_all(&(self.nodes.len() as u32).to_le_bytes())?;
 
-        let nodes = self.nodes.read();
-        // Num nodes
-        writer.write_all(&(nodes.len() as u32).to_le_bytes())?;
+        // Collect populated slots (no lock needed — OnceLock handles it).
+        let populated: Vec<(u32, &HnswNode)> = self
+            .nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, slot)| slot.get().map(|n| (i as u32, n)))
+            .collect();
 
-        // Write each node
-        for node in nodes.iter() {
-            // max_layer
+        writer.write_all(&(populated.len() as u32).to_le_bytes())?;
+
+        for (id, node) in populated {
+            writer.write_all(&id.to_le_bytes())?;
             writer.write_all(&[node.max_layer as u8])?;
 
-            // Each layer's neighbors
             for layer in 0..=node.max_layer {
                 let neighbors = node.neighbors[layer].read();
                 writer.write_all(&(neighbors.len() as u16).to_le_bytes())?;
@@ -424,38 +446,38 @@ impl HnswGraph {
         let file = File::open(path)?;
         let mut reader = BufReader::new(file);
 
-        // Magic
         let mut magic = [0u8; 4];
         reader.read_exact(&mut magic)?;
         if &magic != b"HNSW" {
             return Err(CrvecError::InvalidFormat("invalid graph magic".into()));
         }
 
-        // Version
         let mut buf4 = [0u8; 4];
         reader.read_exact(&mut buf4)?;
         let version = u32::from_le_bytes(buf4);
-        if version != 1 {
-            return Err(CrvecError::InvalidFormat(format!("unsupported graph version: {}", version)));
+        if version != GRAPH_FORMAT_VERSION {
+            return Err(CrvecError::InvalidFormat(format!(
+                "unsupported graph version: {} (expected {})",
+                version, GRAPH_FORMAT_VERSION
+            )));
         }
 
-        // Entry point
         reader.read_exact(&mut buf4)?;
         let entry_point = u32::from_le_bytes(buf4);
 
-        // Max level
         reader.read_exact(&mut buf4)?;
         let max_level = u32::from_le_bytes(buf4);
 
-        // M and M0
         reader.read_exact(&mut buf4)?;
         let m = u32::from_le_bytes(buf4) as usize;
         reader.read_exact(&mut buf4)?;
         let m0 = u32::from_le_bytes(buf4) as usize;
 
-        // Num nodes
         reader.read_exact(&mut buf4)?;
-        let num_nodes = u32::from_le_bytes(buf4) as usize;
+        let capacity = u32::from_le_bytes(buf4) as usize;
+
+        reader.read_exact(&mut buf4)?;
+        let num_populated = u32::from_le_bytes(buf4) as usize;
 
         let config = HnswConfig {
             m,
@@ -465,18 +487,27 @@ impl HnswGraph {
             ml: 1.0 / (m as f64).ln(),
         };
 
-        let mut nodes = Vec::with_capacity(num_nodes);
+        let mut nodes: Vec<OnceLock<HnswNode>> = Vec::with_capacity(capacity);
+        for _ in 0..capacity {
+            nodes.push(OnceLock::new());
+        }
 
-        // Read each node
-        for _ in 0..num_nodes {
-            // max_layer
+        for _ in 0..num_populated {
+            reader.read_exact(&mut buf4)?;
+            let id = u32::from_le_bytes(buf4) as usize;
+            if id >= capacity {
+                return Err(CrvecError::InvalidFormat(format!(
+                    "node id {} exceeds capacity {}",
+                    id, capacity
+                )));
+            }
+
             let mut buf1 = [0u8; 1];
             reader.read_exact(&mut buf1)?;
             let max_layer = buf1[0] as usize;
 
             let mut neighbors = Vec::with_capacity(max_layer + 1);
             for _ in 0..=max_layer {
-                // num_neighbors
                 let mut buf2 = [0u8; 2];
                 reader.read_exact(&mut buf2)?;
                 let num_neighbors = u16::from_le_bytes(buf2) as usize;
@@ -489,11 +520,14 @@ impl HnswGraph {
                 neighbors.push(RwLock::new(layer_neighbors));
             }
 
-            nodes.push(HnswNode { max_layer, neighbors });
+            nodes[id]
+                .set(HnswNode { max_layer, neighbors })
+                .map_err(|_| ())
+                .expect("duplicate node id in graph file");
         }
 
         Ok(Self {
-            nodes: RwLock::new(nodes),
+            nodes,
             entry_state: AtomicU64::new(pack_entry_state(entry_point, max_level)),
             config,
         })
